@@ -1,0 +1,26 @@
+streamlit>=1.28.0
+pandas>=2.0.0
+numpy>=1.24.0
+requests>=2.31.0
+plotly>=5.17.0
+python-dotenv>=1.0.0
+geopy>=2.4.0
+folium>=0.14.0
+streamlit-folium>=0.15.0
+redis>=4.0.0
+asyncio-throttle>=1.0.0
+pydantic>=2.0.0
+pytest>=7.0.0
+pathlib2>=2.3.0
+
+# Interactive measurement system dependencies
+pyproj>=3.6.0
+shapely>=2.0.0
+geopandas>=0.14.0
+
+# AI Chatbot dependencies
+groq>=0.4.1
+sentence-transformers>=2.2.2
+chromadb>=0.4.15
+faiss-cpu>=1.7.4
+transformers>=4.35.0
