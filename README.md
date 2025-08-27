@@ -53,6 +53,7 @@ The Oakville Real Estate Analyzer is a comprehensive Streamlit web application t
 - Building Height Limits
 - Setback Requirements
 - Buildable Area Analysis
+- Final Buildable Floor Area Calculation
 - Potential Unit Count
 
 **Rules Applied:**
@@ -213,7 +214,39 @@ efficiency_ratio = buildable_area ÷ lot_area
 
 **Note:** Calculation only performed when all setback values are available from official zoning data.
 
-### 6. Unit Density Calculations
+### 6. Final Buildable Floor Area Analysis
+
+**Comprehensive Calculation Process:**
+```python
+# Step 1: Lot Coverage Calculation
+lot_coverage_area = lot_area × (zone_coverage_percentage ÷ 100)
+
+# Step 2: Gross Floor Area (Multi-storey)
+max_floors = min(zone_max_storeys, 2)  # Typically 2 for residential
+gross_floor_area = lot_coverage_area × max_floors
+
+# Step 3: Setback Deductions
+setback_deduction = 750  # Standard deduction in sq. ft.
+final_buildable_area = gross_floor_area - setback_deduction
+```
+
+**Example Calculation:**
+```
+Property: 1898.52 m² (RL2-0 zone, 30% coverage)
+├── Lot Coverage: 30% × 1898.52 = 569.56 m² (6,130.65 sq. ft.)
+├── Gross Floor Area: 6,130.65 × 2 floors = 12,261.3 sq. ft.
+├── Setback Deductions: 12,261.3 - 750 = 11,511.3 sq. ft.
+└── Final Result: ~11,511 sq. ft. buildable area
+```
+
+**Analysis Features:**
+- Zone-specific coverage percentages
+- Multi-storey calculations with height limits  
+- Standard setback deductions
+- Confidence level assessment
+- Method transparency (Coverage vs. FAR)
+
+### 7. Unit Density Calculations
 
 #### Single-Family Zones (RL1-RL6)
 - **Units:** 1 dwelling unit
@@ -369,6 +402,8 @@ app_new.py (Main Application)
 #### Conservation Assessment
 - `detect_conservation_requirements()`: Heritage district identification
 - `detect_arborist_requirements()`: Tree preservation assessment
+- `check_heritage_property_status()`: Real-time heritage API verification
+- `check_development_applications()`: Active development monitoring
 - `analyze_environmental_constraints()`: Natural feature analysis
 
 ### 3. Data Structures
@@ -415,7 +450,18 @@ app_new.py (Main Application)
     "usable_frontage": 18.1,
     "usable_depth": 10.5,
     "efficiency_ratio": 0.208,
-    "potential_units": 1
+    "potential_units": 1,
+    "final_buildable_analysis": {
+        "calculation_method": "Standard",
+        "lot_coverage_sqm": 569.56,
+        "lot_coverage_sqft": 6130.65,
+        "max_floors": 2,
+        "gross_floor_area_sqft": 12261.3,
+        "setback_deduction_sqft": 750,
+        "final_buildable_sqft": 11511.3,
+        "confidence_level": "High",
+        "analysis_note": "Based on RL2-0 zoning regulations and 30% lot coverage"
+    }
 }
 ```
 
@@ -454,6 +500,8 @@ app_new.py (Main Application)
 #### ArcGIS REST Services
 - **Parcels Service:** Property boundaries and attributes
 - **Zoning Service:** Current zoning designations and classes
+- **Heritage Properties Service:** Designated heritage properties and conservation districts
+- **Development Applications Service:** Active development applications and permits
 - **Planning Service:** Development applications and approvals
 
 ### 2. Data Files Structure
@@ -513,6 +561,48 @@ https://gis.oakville.ca/arcgis/rest/services/
 - `spatialRel`: esriSpatialRelIntersects
 - `outFields`: Zone code and classification
 
+#### Heritage Properties Service
+```
+https://maps.oakville.ca/oakgis/rest/services/
+├── SBS/
+└── Heritage_Properties/FeatureServer/0
+```
+
+**Query Parameters:**
+- `geometry`: Point coordinates for spatial search
+- `distance`: Search radius in meters (100m-1000m)
+- `units`: esriSRUnit_Meter
+- `spatialRel`: esriSpatialRelIntersects
+- `outFields`: ADDRESS,HER_ID,BYLAW,DESIGNATION_YEAR,STATUS,HISTORY,DESCRIPTION
+
+**Data Retrieved:**
+- Heritage property addresses and IDs
+- Designation by-laws and years
+- Heritage status (Part IV, etc.)
+- Historical significance descriptions
+- Property histories and architectural details
+
+#### Development Applications Service
+```
+https://maps.oakville.ca/oakgis/rest/services/
+├── SBS/
+└── Development_Applications/FeatureServer/4
+```
+
+**Query Parameters:**
+- `geometry`: Point coordinates for spatial search
+- `distance`: Search radius in meters (500m default)
+- `units`: esriSRUnit_Meter
+- `spatialRel`: esriSpatialRelIntersects
+- `outFields`: APPLICATION_NUMBER,DESCRIPTION,STATUS,APP_TYPE,DATE_RECEIVED,ADDRESS
+
+**Data Retrieved:**
+- Application numbers and descriptions
+- Development application status
+- Application types and submission dates
+- Property addresses and project details
+- Active development monitoring
+
 ### 2. Coordinate System Handling
 
 #### Input Formats
@@ -551,8 +641,14 @@ x_utm, y_utm = transformer.transform(longitude, latitude)
 - **Zoning Analysis:** Comprehensive zoning display
 - **Property Valuation:** Market analysis and pricing
 - **Development Potential:** Building capacity analysis
-- **Special Requirements:** Heritage and environmental
+- **Special Requirements:** Heritage and environmental with Live API Checks
 - **Zone Rules:** Complete regulatory reference
+
+#### Live API Integration Features
+- **Heritage Property Status:** Real-time heritage designation checking
+- **Development Applications:** Active application monitoring within 500m radius
+- **Site Info Display:** Heritage, Development Apps, Conservation, and Arborist status
+- **Detailed Expandable Cards:** Complete heritage and development information
 
 #### Responsive Design
 - Desktop optimization (1920×1080 primary)
@@ -757,6 +853,9 @@ The Oakville Real Estate Analyzer represents a comprehensive implementation of m
 - **Municipal Report Format:** Professional presentation matching planning department standards
 - **Error-Free Operation:** Robust null value handling and graceful degradation
 - **Real-Time Data Integration:** Live connection to Oakville's official ArcGIS services
+- **Heritage Property Integration:** Real-time heritage designation verification from official database
+- **Development Activity Monitoring:** Live tracking of development applications within property vicinity
+- **Final Buildable Area Analysis:** Comprehensive calculation with transparent methodology
 - **Dual Unit Display:** Both metric and imperial measurements throughout
 - **Accessibility Focused:** No assumptions or hardcoded values, only verified data
 
@@ -764,9 +863,11 @@ The Oakville Real Estate Analyzer represents a comprehensive implementation of m
 - Commercial and industrial zone support
 - 3D building envelope visualization  
 - Historical zoning change tracking
-- Development application integration
-- Automated compliance reporting
+- Building permit integration and tracking
+- Automated compliance reporting with PDF generation
 - Mobile application development
+- Advanced heritage impact assessments
+- Environmental constraint mapping integration
 
 ---
 

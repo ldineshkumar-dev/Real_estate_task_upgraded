@@ -14,12 +14,20 @@ import plotly.graph_objects as go
 from datetime import datetime
 import numpy as np
 import math
+import io
 try:
     from pyproj import Transformer
     PYPROJ_AVAILABLE = True
 except ImportError:
     PYPROJ_AVAILABLE = False
     st.warning("⚠️ PyProj not available. Coordinate transformation features will be limited.")
+
+try:
+    from pdf_generator import PropertyReportGenerator
+    PDF_GENERATOR_AVAILABLE = True
+except ImportError:
+    PDF_GENERATOR_AVAILABLE = False
+    st.warning("⚠️ PDF Generator not available. PDF download feature will be limited.")
 
 # ------------------------
 # CONFIG & CONSTANTS
@@ -396,6 +404,257 @@ def detect_arborist_requirements(parcel, lot_area, development_potential):
     
     # Cannot determine without specific site conditions
     return "Unknown"
+
+def check_heritage_property_status(lat, lon, address=None):
+    """Check if a property is designated heritage or is within heritage area"""
+    try:
+        # Heritage Properties API
+        url = "https://maps.oakville.ca/oakgis/rest/services/SBS/Heritage_Properties/FeatureServer/0/query"
+        
+        # First try spatial query around the property
+        params = {
+            'geometry': f'{lon},{lat}',
+            'geometryType': 'esriGeometryPoint',
+            'distance': 100,  # 100m radius
+            'units': 'esriSRUnit_Meter',
+            'inSR': '4326',
+            'spatialRel': 'esriSpatialRelIntersects',
+            'outFields': 'ADDRESS,HER_ID,BYLAW,DESIGNATION_YEAR,STATUS,HISTORY,DESCRIPTION',
+            'f': 'json'
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+        
+        if 'features' in data and data['features']:
+            # Found heritage property at or near this location
+            heritage_info = {
+                'is_heritage': True,
+                'designation_type': 'Direct',
+                'properties': []
+            }
+            
+            for feature in data['features']:
+                attrs = feature.get('attributes', {})
+                heritage_info['properties'].append({
+                    'address': attrs.get('ADDRESS'),
+                    'heritage_id': attrs.get('HER_ID'),
+                    'bylaw': attrs.get('BYLAW'),
+                    'year': attrs.get('DESIGNATION_YEAR'),
+                    'status': attrs.get('STATUS'),
+                    'history': attrs.get('HISTORY'),
+                    'description': attrs.get('DESCRIPTION')
+                })
+            
+            return heritage_info
+        
+        # Check if in heritage district (wider search)
+        params['distance'] = 500  # 500m radius for district check
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+        
+        if 'features' in data and len(data['features']) > 3:
+            # Multiple heritage properties nearby suggest heritage district
+            return {
+                'is_heritage': False,
+                'designation_type': 'Nearby',
+                'nearby_heritage_count': len(data['features']),
+                'note': 'Property is in area with multiple heritage properties'
+            }
+        
+        return {
+            'is_heritage': False,
+            'designation_type': None,
+            'note': 'No heritage designation found'
+        }
+        
+    except Exception as e:
+        return {
+            'is_heritage': False,
+            'designation_type': 'Unknown',
+            'error': str(e)
+        }
+
+def check_development_applications(lat, lon, radius=500):
+    """Check for active development applications in the area"""
+    try:
+        # Development Applications API - using correct layer ID 4
+        url = "https://maps.oakville.ca/oakgis/rest/services/SBS/Development_Applications/FeatureServer/4/query"
+        
+        params = {
+            'geometry': f'{lon},{lat}',
+            'geometryType': 'esriGeometryPoint',
+            'distance': radius,
+            'units': 'esriSRUnit_Meter',
+            'inSR': '4326',
+            'spatialRel': 'esriSpatialRelIntersects',
+            'outFields': '*',
+            'f': 'json'
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+        
+        development_info = {
+            'has_applications': False,
+            'applications': [],
+            'total_count': 0
+        }
+        
+        if 'features' in data and data['features']:
+            development_info['has_applications'] = True
+            development_info['total_count'] = len(data['features'])
+            
+            for feature in data['features'][:5]:  # Limit to 5 most recent
+                attrs = feature.get('attributes', {})
+                
+                # Get all available fields for debugging
+                available_fields = list(attrs.keys()) if attrs else []
+                
+                # Use the correct field names from the Development Applications API
+                app_number = attrs.get('ID_NUMBER', 'Unknown')
+                
+                # The API doesn't have a description field, so we'll indicate this
+                description = 'Description not available in API'
+                
+                # Use DEV_ENG_STATUS for status
+                status = attrs.get('DEV_ENG_STATUS', 'Unknown')
+                if not status or status.strip() == '':
+                    status = 'Status not available'
+                
+                # Use TYPE field for application type
+                app_type = attrs.get('TYPE', 'Unknown')
+                
+                # Convert date from timestamp if available
+                date_created = attrs.get('CREATED_DATE')
+                if date_created:
+                    try:
+                        # Convert from epoch milliseconds to readable date
+                        import datetime
+                        date_received = datetime.datetime.fromtimestamp(date_created / 1000).strftime('%Y-%m-%d')
+                    except:
+                        date_received = 'Date conversion failed'
+                else:
+                    date_received = None
+                
+                # The API doesn't have address field
+                address = None
+                
+                development_info['applications'].append({
+                    'application_number': app_number,
+                    'description': description,
+                    'status': status,
+                    'type': app_type,
+                    'date_received': date_received,
+                    'address': address,
+                    'folder_rsn': attrs.get('FOLDER_RSN'),
+                    'parent_rsn': attrs.get('PARENT_RSN'),
+                    'north_oak': attrs.get('NORTH_OAK'),
+                    'available_fields': available_fields  # For debugging
+                })
+        
+        return development_info
+        
+    except Exception as e:
+        return {
+            'has_applications': False,
+            'applications': [],
+            'error': str(e)
+        }
+
+def check_conservation_authority(lat, lon):
+    """Check which conservation authority has jurisdiction over the property"""
+    try:
+        # Conservation Halton Watersheds Service
+        url = "https://gis.conservationhalton.net/chmaps/rest/services/ms-oper/Watersheds/MapServer/identify"
+        
+        # Convert WGS84 to UTM Zone 17N (Conservation Halton's coordinate system)
+        from pyproj import Transformer
+        transformer = Transformer.from_crs("EPSG:4326", "EPSG:26917", always_xy=True)
+        x_utm, y_utm = transformer.transform(lon, lat)
+        
+        params = {
+            'geometry': f'{x_utm},{y_utm}',
+            'geometryType': 'esriGeometryPoint',
+            'layers': 'all',
+            'tolerance': 5,
+            'mapExtent': f'{x_utm-1000},{y_utm-1000},{x_utm+1000},{y_utm+1000}',
+            'imageDisplay': '400,400,96',
+            'returnGeometry': 'false',
+            'f': 'json'
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+        
+        conservation_info = {
+            'conservation_authority': 'Unknown',
+            'within_watershed': False,
+            'watershed_details': {},
+            'permits_required': 'Unknown',
+            'contact_info': {},
+            'regulated_features': []
+        }
+        
+        # Check if within Conservation Halton watershed
+        if 'results' in data and data['results']:
+            for result in data['results']:
+                layer_name = result.get('layerName', '')
+                attributes = result.get('attributes', {})
+                
+                if 'watershed' in layer_name.lower() or 'conservation' in layer_name.lower():
+                    conservation_info['within_watershed'] = True
+                    conservation_info['conservation_authority'] = 'Halton Conservation Authority'
+                    conservation_info['watershed_details'] = attributes
+                    
+                    # Set contact information for Halton Conservation
+                    conservation_info['contact_info'] = {
+                        'name': 'Halton Conservation Authority',
+                        'website': 'https://conservationhalton.ca',
+                        'email': 'web@hrca.on.ca',
+                        'phone': '905.336.1158',
+                        'address': '2596 Britannia Road West, Burlington, Ontario L7P 0G3'
+                    }
+                    
+                    # Determine permit requirements (general rules for Oakville area)
+                    conservation_info['permits_required'] = 'Likely Required'
+                    conservation_info['regulated_features'] = [
+                        'Development within 30m of watercourse',
+                        'Alteration of watercourse',
+                        'Development in flood hazard areas',
+                        'Wetland interference',
+                        'Development on unstable slopes'
+                    ]
+        
+        # If not within Halton Conservation, check if it's near other conservation authorities
+        if not conservation_info['within_watershed']:
+            # For Oakville properties, still likely under Halton Conservation influence
+            if 43.40 <= lat <= 43.55 and -79.80 <= lon <= -79.60:  # Oakville bounds
+                conservation_info['conservation_authority'] = 'Halton Conservation Authority (Assumed)'
+                conservation_info['permits_required'] = 'Possibly Required'
+                conservation_info['contact_info'] = {
+                    'name': 'Halton Conservation Authority',
+                    'website': 'https://conservationhalton.ca',
+                    'email': 'web@hrca.on.ca',
+                    'phone': '905.336.1158'
+                }
+        
+        return conservation_info
+        
+    except Exception as e:
+        # Fallback for Oakville properties
+        return {
+            'conservation_authority': 'Halton Conservation Authority (Default)',
+            'within_watershed': 'Unknown',
+            'permits_required': 'Contact Required',
+            'contact_info': {
+                'name': 'Halton Conservation Authority',
+                'website': 'https://conservationhalton.ca',
+                'email': 'web@hrca.on.ca',
+                'phone': '905.336.1158'
+            },
+            'error': str(e)
+        }
 
 # ------------------------
 # API HELPERS
@@ -1064,7 +1323,7 @@ def calculate_buildable_area(lot_area: float, lot_frontage: float, lot_depth: fl
     front_yard = setbacks.get('front_yard')
     rear_yard = setbacks.get('rear_yard')
     
-    if not all([interior_side, front_yard, rear_yard, lot_frontage, lot_depth]):
+    if not all([interior_side, front_yard, rear_yard]) or lot_frontage <= 0 or lot_depth <= 0:
         return {
             'usable_frontage': None,
             'usable_depth': None,
@@ -1072,18 +1331,31 @@ def calculate_buildable_area(lot_area: float, lot_frontage: float, lot_depth: fl
             'efficiency_ratio': None
         }
     
-    # Skip calculation for special -0 zone cases that require survey data
-    if isinstance(front_yard, str):
+    # Safe conversion function for setback values
+    def safe_float(value, default=0):
+        try:
+            return float(value) if value is not None else default
+        except (ValueError, TypeError):
+            return default
+    
+    # Convert setback values safely, handling strings like "-1"
+    interior_side_val = safe_float(interior_side)
+    front_yard_val = safe_float(front_yard)
+    rear_yard_val = safe_float(rear_yard)
+    
+    # For -0 zones with "existing -1" setbacks, we can't calculate without survey data
+    if isinstance(front_yard, str) and front_yard == "-1":
         return {
             'usable_frontage': None,
             'usable_depth': None,
             'buildable_area': None,
-            'efficiency_ratio': None
+            'efficiency_ratio': None,
+            'note': 'Requires survey data for existing building setback calculation'
         }
     
     # Calculate usable dimensions after setbacks
-    usable_frontage = lot_frontage - interior_side * 2
-    usable_depth = lot_depth - front_yard - rear_yard
+    usable_frontage = lot_frontage - interior_side_val * 2
+    usable_depth = lot_depth - front_yard_val - rear_yard_val
     
     # Ensure positive values
     usable_frontage = max(usable_frontage, 0)
@@ -1125,11 +1397,13 @@ def calculate_development_potential(zone_code, lot_area, lot_frontage, lot_depth
         results["meets_minimum_requirements"] = False
         results["violations"].append(f"Lot area {lot_area:.1f} m² ({lot_area * 10.764:.0f} sq ft) is below minimum {min_area:.1f} m² ({min_area * 10.764:.0f} sq ft)")
     
-    # Check minimum frontage
+    # Check minimum frontage - only if frontage is provided (> 0)
     min_frontage = rules.get('min_lot_frontage')
-    if min_frontage and lot_frontage < min_frontage:
+    if min_frontage and lot_frontage > 0 and lot_frontage < min_frontage:
         results["meets_minimum_requirements"] = False
         results["violations"].append(f"Lot frontage {lot_frontage:.1f} m is below minimum {min_frontage:.1f} m")
+    elif lot_frontage == 0:
+        results["warnings"].append("Lot frontage not available - cannot verify minimum frontage requirements")
     
     # Calculate precise setbacks
     setbacks = calculate_precise_setbacks(zone_code, lot_frontage, lot_depth, is_corner)
@@ -1190,7 +1464,88 @@ def calculate_development_potential(zone_code, lot_area, lot_frontage, lot_depth
     if rules.get('plan_subdivision_adjustments'):
         results["plan_subdivision_adjustments"] = rules['plan_subdivision_adjustments']
     
+    # Calculate final buildable floor area analysis
+    final_analysis = calculate_final_buildable_area(zone_code, lot_area, results)
+    results["final_buildable_analysis"] = final_analysis
+    
     return results
+
+def calculate_final_buildable_area(zone_code: str, lot_area: float, development_data: dict) -> dict:
+    """Calculate the final buildable floor area with comprehensive analysis"""
+    
+    analysis = {
+        "calculation_method": "Standard",
+        "lot_coverage_sqm": None,
+        "lot_coverage_sqft": None,
+        "max_floors": 2,  # Default to 2 storeys for most residential zones
+        "gross_floor_area_sqm": None,
+        "gross_floor_area_sqft": None,
+        "setback_deduction_sqft": 750,  # Standard setback deduction
+        "final_buildable_sqm": None,
+        "final_buildable_sqft": None,
+        "confidence_level": "High",
+        "analysis_note": None
+    }
+    
+    # Get zone rules
+    rules = get_zone_rules(zone_code)
+    if not rules:
+        analysis["confidence_level"] = "Low"
+        analysis["analysis_note"] = "Zone rules not available"
+        return analysis
+    
+    # Get maximum coverage
+    max_coverage_pct = development_data.get("max_coverage_percent")
+    if max_coverage_pct:
+        lot_coverage_sqm = lot_area * (max_coverage_pct / 100)
+        analysis["lot_coverage_sqm"] = lot_coverage_sqm
+        analysis["lot_coverage_sqft"] = lot_coverage_sqm * 10.764
+        
+        # Determine number of floors based on zone and height
+        max_storeys = development_data.get("max_storeys") or rules.get('max_storeys') or 2
+        if max_storeys:
+            analysis["max_floors"] = min(max_storeys, 2)  # Typically 2 floors for residential
+        
+        # Calculate gross floor area (coverage × floors)
+        gross_floor_area_sqft = analysis["lot_coverage_sqft"] * analysis["max_floors"]
+        analysis["gross_floor_area_sqft"] = gross_floor_area_sqft
+        analysis["gross_floor_area_sqm"] = gross_floor_area_sqft / 10.764
+        
+        # Apply setback deductions
+        final_buildable_sqft = gross_floor_area_sqft - analysis["setback_deduction_sqft"]
+        analysis["final_buildable_sqft"] = max(final_buildable_sqft, 0)
+        analysis["final_buildable_sqm"] = analysis["final_buildable_sqft"] / 10.764
+        
+        # Add confidence note
+        if development_data.get("suffix") == "-0":
+            # Check if buildable area calculation was affected by "-1" setback
+            if development_data.get('note') and 'survey data' in development_data.get('note', ''):
+                analysis["analysis_note"] = "Based on -0 suffix zone regulations. Note: Front yard setback requires survey data for precise calculation."
+                analysis["confidence_level"] = "Moderate"
+            else:
+                analysis["analysis_note"] = "Based on -0 suffix zone regulations with existing -1m front yard setback"
+        else:
+            analysis["analysis_note"] = f"Based on {zone_code} zoning regulations and {max_coverage_pct:.0f}% lot coverage"
+            
+    else:
+        # Use FAR method if coverage not available
+        max_floor_area = development_data.get("max_floor_area")
+        if max_floor_area:
+            analysis["calculation_method"] = "Floor Area Ratio"
+            analysis["gross_floor_area_sqm"] = max_floor_area
+            analysis["gross_floor_area_sqft"] = max_floor_area * 10.764
+            
+            # Apply standard deductions
+            final_buildable_sqft = (max_floor_area * 10.764) - analysis["setback_deduction_sqft"]
+            analysis["final_buildable_sqft"] = max(final_buildable_sqft, 0)
+            analysis["final_buildable_sqm"] = analysis["final_buildable_sqft"] / 10.764
+            
+            analysis["analysis_note"] = f"Based on Floor Area Ratio calculation for {zone_code}"
+        else:
+            analysis["confidence_level"] = "Low"
+            analysis["analysis_note"] = "Insufficient data for calculation"
+    
+    return analysis
 
 def calculate_potential_units(zone_code: str, lot_area: float, max_floor_area: float) -> int:
     """Calculate potential number of dwelling units"""
@@ -1476,7 +1831,7 @@ def display_zone_rules_tab(zone_code: str):
             far_suffix = zone_rules.get('max_residential_floor_area_ratio_suffix_0')
             if far_suffix and parsed_info['has_suffix_zero']:
                 st.metric("-0 Zone FAR", f"{far_suffix}")
-                st.caption("From lookup table")
+                st.caption("Enhanced infill development")
     
     st.markdown("---")
     
@@ -1864,8 +2219,11 @@ def calculate_development_value(zone_code, lot_area, development_potential, curr
     
     # Calculate potential units (simplified)
     max_floor_area = development_potential.get('max_floor_area', 0)
+    if max_floor_area is None:
+        max_floor_area = 0
+    
     avg_unit_size = 120  # 120 sqm (~1,292 sq ft) average unit
-    potential_units = int(max_floor_area / avg_unit_size) if max_floor_area > 0 else 1
+    potential_units = int(max_floor_area / avg_unit_size) if max_floor_area and max_floor_area > 0 else 1
     
     if potential_units <= 1:
         return {"message": "No multi-unit development potential"}
@@ -1893,6 +2251,180 @@ def calculate_development_value(zone_code, lot_area, development_potential, curr
         "feasible": profit_margin > 15,
         "roi_percentage": round((potential_profit / total_costs * 100), 1) if total_costs > 0 else 0
     }
+
+# ------------------------
+# PDF DATA PREPARATION
+# ------------------------
+def prepare_property_data_for_pdf(parcel, zone_code, full_zone_code, development_potential, setbacks, lot_area_m2, frontage, depth):
+    """Prepare all property data for PDF generation"""
+    
+    # Get coordinates for additional API checks
+    lat = parcel.get('lat')
+    lon = parcel.get('lon')
+    
+    # Basic property information
+    property_data = {
+        'address': parcel.get('address', 'Unknown Address'),
+        'designation': full_zone_code or zone_code or 'Unknown',
+        'lot_area': round(lot_area_m2, 2) if lot_area_m2 else 0,
+        'frontage': round(frontage, 2) if frontage else 0,
+        'depth': round(depth, 2) if depth else 0,
+    }
+    
+    # Get real-time conservation authority data
+    if lat and lon:
+        try:
+            conservation_check = check_conservation_authority(lat, lon)
+            ca_name = conservation_check.get('conservation_authority', 'Unknown')
+            if 'Halton' in ca_name:
+                permits_req = conservation_check.get('permits_required', 'Unknown')
+                if permits_req == 'Likely Required':
+                    property_data['conservation_authority'] = "Halton CA - Permits Required"
+                elif permits_req == 'Possibly Required':
+                    property_data['conservation_authority'] = "Halton CA - Contact Required"
+                else:
+                    property_data['conservation_authority'] = "Halton Conservation Authority"
+            else:
+                property_data['conservation_authority'] = ca_name
+                
+            # Get heritage status
+            heritage_check = check_heritage_property_status(lat, lon)
+            property_data['heritage_status'] = 'Yes' if heritage_check.get('is_heritage') else 'No'
+            
+            # Get development applications
+            dev_check = check_development_applications(lat, lon)
+            property_data['development_status'] = 'Yes' if dev_check.get('has_applications') else 'No'
+            
+        except:
+            property_data['conservation_authority'] = 'Unable to verify - contact required'
+            property_data['heritage_status'] = 'Unable to check'
+            property_data['development_status'] = 'Unable to check'
+    else:
+        property_data['conservation_authority'] = 'Unknown - coordinates required'
+        property_data['heritage_status'] = 'Unknown'  
+        property_data['development_status'] = 'Unknown'
+    
+    # Set default values for other statuses
+    property_data.update({
+        'conservation_status': 'No',  # Environmental conservation overlay
+        'arborist_status': 'Yes'  # Default assumption for tree preservation
+    })
+    
+    # Extract development potential data
+    if development_potential:
+        # Max RFA data (direct from development_potential)
+        property_data.update({
+            'max_floor_area': development_potential.get('max_floor_area', 0),
+            'max_far': development_potential.get('max_floor_area_ratio', 0)
+        })
+        
+        # Building size limits
+        property_data.update({
+            'max_building_depth': development_potential.get('max_building_depth', 0),
+            'garage_projection': development_potential.get('garage_projection_beyond_dwelling', 0)
+        })
+        
+        # Coverage data (direct from development_potential)
+        property_data.update({
+            'max_coverage_area': development_potential.get('max_coverage_area', 0),
+            'max_coverage_percent': development_potential.get('max_coverage_percent', 0)
+        })
+        
+        # Height limits
+        height_data = development_potential.get('height_limits', {})
+        property_data.update({
+            'building_height': height_data.get('building_height', 0),
+            'flat_roof_height': height_data.get('flat_roof', 0),
+            'eaves_height': 'N/A',
+            'storeys': height_data.get('storeys', 2)
+        })
+        
+        # Final buildable analysis
+        final_analysis = development_potential.get('final_buildable_analysis', {})
+        property_data.update({
+            'final_buildable_sqft': final_analysis.get('final_buildable_sqft', 0),
+            'final_buildable_sqm': final_analysis.get('final_buildable_sqm', 0),
+            'confidence_level': final_analysis.get('confidence_level', 'Moderate')
+        })
+    
+    # Setback data - structured for PDF generator
+    if setbacks:
+        front_yard = setbacks.get('front_yard', 'N/A')
+        property_data['setbacks'] = {
+            'front_yard': front_yard,
+            'interior_side_min': setbacks.get('interior_side_min', setbacks.get('interior_side', 'N/A')),
+            'interior_side_max': setbacks.get('interior_side_max', setbacks.get('interior_side', 'N/A')),
+            'rear_yard': setbacks.get('rear_yard', 'N/A')
+        }
+        property_data['has_suffix_zero'] = full_zone_code and '-0' in full_zone_code
+    else:
+        property_data['setbacks'] = {
+            'front_yard': 'N/A',
+            'interior_side_min': 'N/A',
+            'interior_side_max': 'N/A',
+            'rear_yard': 'N/A'
+        }
+        property_data['has_suffix_zero'] = False
+    
+    # Add comprehensive zone details and special provisions
+    if zone_code:
+        try:
+            # Get detailed zone rules
+            zone_rules = get_comprehensive_zone_rules(full_zone_code or zone_code)
+            if zone_rules and 'error' not in zone_rules:
+                # Add zone information
+                property_data['zone_name'] = zone_rules.get('name', 'N/A')
+                property_data['zone_category'] = zone_rules.get('category', 'N/A')
+                
+                # Get parsed zone info for special provisions
+                parsed_info = zone_rules.get('_parsed_info', {})
+                if parsed_info.get('special_provision'):
+                    property_data['special_provision'] = parsed_info['special_provision']
+                    # Get special provision details
+                    sp_data = SPECIAL_PROVISIONS.get(parsed_info['special_provision'], {})
+                    property_data['special_provision_description'] = sp_data.get('description', 'Site-specific zoning requirements')
+                else:
+                    property_data['special_provision'] = None
+                    property_data['special_provision_description'] = None
+                
+                # Add suffix-0 specific details if applicable
+                if parsed_info.get('has_suffix_zero'):
+                    property_data['has_suffix_zero'] = True
+                    property_data['suffix_zero_details'] = {
+                        'front_yard_setback': 'Existing building setback minus 1 metre',
+                        'max_height': zone_rules.get('max_height_suffix_0', zone_rules.get('max_height', 'N/A')),
+                        'max_storeys': zone_rules.get('max_storeys_suffix_0', zone_rules.get('max_storeys', 'N/A')),
+                        'max_coverage': zone_rules.get('max_lot_coverage_suffix_0', zone_rules.get('max_lot_coverage', 'N/A')),
+                        'max_far': zone_rules.get('max_residential_floor_area_ratio_suffix_0', zone_rules.get('max_residential_floor_area_ratio', 'N/A')),
+                        'description': 'Zone modifications for infill development - reduced setbacks and enhanced permissions'
+                    }
+                else:
+                    property_data['suffix_zero_details'] = None
+                
+                # Add permitted uses
+                permitted_uses = zone_rules.get('permitted_uses', [])
+                property_data['permitted_uses'] = [use.replace('_', ' ').title() for use in permitted_uses[:5]]  # Limit to first 5
+                
+                # Add use restrictions if any
+                restrictions = zone_rules.get('use_restrictions', {})
+                if restrictions:
+                    restricted_list = []
+                    for category, uses in restrictions.items():
+                        restricted_list.extend(uses[:2])  # Limit items
+                    property_data['use_restrictions'] = [use.replace('_', ' ').title() for use in restricted_list[:3]]
+                else:
+                    property_data['use_restrictions'] = []
+                    
+        except Exception as e:
+            # Fallback if zone rules lookup fails
+            property_data['zone_name'] = 'N/A'
+            property_data['zone_category'] = 'N/A'
+            property_data['special_provision'] = None
+            property_data['special_provision_description'] = None
+            property_data['permitted_uses'] = []
+            property_data['use_restrictions'] = []
+    
+    return property_data
 
 # ------------------------
 # STREAMLIT APP
@@ -1949,14 +2481,194 @@ def main():
         bathrooms = st.number_input("Bathrooms", min_value=1.0, value=2.5, step=0.5)
         age = st.number_input("Building Age (years)", min_value=0, value=10, step=1)
         
-        st.header("🌟 Property Features")
-        nearby_parks = st.number_input("Nearby Parks (within 1km)", min_value=0, value=1, step=1)
-        waterfront = st.checkbox("Waterfront Property")
-        heritage = st.checkbox("Heritage Designated")
-        corner_lot = st.checkbox("Corner Lot")
+        st.header("📖 How to Use")
+        with st.expander("🔍 **Search Methods**", expanded=True):
+            st.write("**Address Search:** Enter full address (e.g., '383 MAPLEHURST AVE')")
+            st.write("**Coordinates:** Use if address not found in database")
+            st.write("**🌍 Geocoding:** Automatically enabled for unlisted addresses")
+        
+        with st.expander("📊 **Understanding Results**"):
+            st.write("**Zone Code:** Shows base zone + modifications (e.g., RL1-0)")
+            st.write("**Suffix-0:** Enhanced infill development permissions")
+            st.write("**Special Provisions:** Site-specific requirements (SP:1, SP:2)")
+            st.write("**Setbacks:** Building placement requirements from property lines")
+        
+        with st.expander("🏗️ **Development Analysis**"):
+            st.write("**Max Coverage:** Maximum building footprint allowed")
+            st.write("**Floor Area Ratio:** Maximum floor area relative to lot size")
+            st.write("**Final Buildable:** Estimated buildable area after all restrictions")
+            st.write("**Confidence Level:** Reliability of calculations")
+        
+        with st.expander("📄 **PDF Reports**"):
+            st.write("**Generate Report:** Creates comprehensive property analysis")
+            st.write("**Includes:** All calculations, zone details, authority requirements")
+            st.write("**Professional Format:** Suitable for planning applications")
     
-    # Main content
-    if 'lookup_triggered' in st.session_state and st.session_state['lookup_triggered']:
+    # Main content - Show system overview when no search is active
+    if 'lookup_triggered' not in st.session_state or not st.session_state.get('lookup_triggered', False):
+        # System Overview Section
+        st.markdown("---")
+        st.header("🏗️ Oakville Real Estate Analyzer - System Overview")
+        
+        # Introduction
+        intro_col1, intro_col2 = st.columns([2, 1])
+        with intro_col1:
+            st.markdown("""
+            ### 🎯 **What This System Does**
+            
+            The Oakville Real Estate Analyzer is an AI-powered platform that provides comprehensive property analysis 
+            for Oakville, Ontario. It combines zoning regulations, real-time municipal data, and development calculations 
+            to help property owners, developers, and real estate professionals make informed decisions.
+            
+            **Key Features:**
+            - 🏘️ **Zoning Analysis** - Detailed zone code interpretation with special provisions
+            - 📐 **Development Calculations** - Maximum buildable area, coverage, and setbacks
+            - 🏛️ **Authority Integration** - Real-time checks for heritage, conservation, and development status
+            - 📄 **Professional Reports** - Comprehensive PDF reports for planning applications
+            """)
+            
+        with intro_col2:
+            st.info("""
+            **🚀 Quick Start**
+            
+            1️⃣ Enter property address
+            
+            2️⃣ Review zoning analysis
+            
+            3️⃣ Check development potential
+            
+            4️⃣ Download PDF report
+            """)
+        
+        st.markdown("---")
+        
+        # Technical Implementation Details
+        st.subheader("⚙️ How the System Works")
+        
+        tech_tabs = st.tabs(["🗂️ Data Sources", "🔄 Processing", "📊 Calculations", "🎯 Accuracy"])
+        
+        with tech_tabs[0]:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("""
+                **Municipal APIs:**
+                - Oakville Parcels & Addresses Database
+                - Zoning By-law 2014-014 (Live Data)
+                - Heritage Properties Registry
+                - Development Applications Tracker
+                - Conservation Authority Watersheds
+                """)
+            with col2:
+                st.markdown("""
+                **Zoning Regulations:**
+                - Comprehensive zone rules (RL1-RL11, RM, RH)
+                - Suffix-0 zone modifications
+                - Special provisions (SP:1, SP:2, etc.)
+                - Setback calculations with corner lot adjustments
+                - Building envelope analysis
+                """)
+        
+        with tech_tabs[1]:
+            st.markdown("""
+            **Data Processing Pipeline:**
+            
+            1. **Address Resolution** → Geocoding → Coordinate validation
+            2. **Spatial Queries** → API calls to municipal databases
+            3. **Zone Analysis** → Rule interpretation and modification application
+            4. **Calculations** → Building envelope, coverage, and FAR computations
+            5. **Authority Checks** → Real-time heritage, conservation, and development verification
+            6. **Report Generation** → Professional PDF with all findings
+            """)
+        
+        with tech_tabs[2]:
+            calculation_col1, calculation_col2 = st.columns(2)
+            with calculation_col1:
+                st.markdown("""
+                **Zoning Calculations:**
+                - **Lot Coverage**: `lot_area × coverage_percentage`
+                - **Floor Area Ratio**: `lot_area × FAR_coefficient`
+                - **Maximum Height**: Zone-specific limits + suffix modifications
+                - **Setbacks**: Front/rear/side yard requirements
+                """)
+            with calculation_col2:
+                st.markdown("""
+                **Development Analysis:**
+                - **Buildable Area**: Coverage - setback deductions
+                - **Gross Floor Area**: Coverage × storeys allowed
+                - **Final Buildable**: GFA - circulation - mechanical
+                - **Confidence Level**: Based on data completeness
+                """)
+        
+        with tech_tabs[3]:
+            accuracy_col1, accuracy_col2 = st.columns(2)
+            with accuracy_col1:
+                st.success("""
+                **High Accuracy Elements:**
+                - Zoning designations (Official By-law)
+                - Parcel boundaries (Municipal database)
+                - Heritage status (Live API)
+                - Conservation authority jurisdiction
+                """)
+            with accuracy_col2:
+                st.warning("""
+                **Verification Recommended:**
+                - Survey-dependent setbacks (existing buildings)
+                - Site-specific conditions
+                - Special provision interpretations
+                - Development application requirements
+                """)
+        
+        st.markdown("---")
+        
+        # Zone Types Overview
+        st.subheader("🏘️ Supported Zone Types")
+        
+        zone_col1, zone_col2, zone_col3 = st.columns(3)
+        with zone_col1:
+            st.markdown("""
+            **Residential Low Density**
+            - RL1 to RL11 (various densities)
+            - Suffix-0 modifications available
+            - Special provisions (SP:1, SP:2)
+            - Detached dwellings primary use
+            """)
+        with zone_col2:
+            st.markdown("""
+            **Medium/High Density**
+            - RM1-RM4 (Medium density)
+            - RH (High density residential)
+            - Multiple dwelling types
+            - Enhanced FAR calculations
+            """)
+        with zone_col3:
+            st.markdown("""
+            **Special Features**
+            - Corner lot adjustments
+            - Garage placement rules
+            - Height bonus provisions
+            - Infill development support
+            """)
+        
+        st.markdown("---")
+        
+        # Sample Analysis
+        st.subheader("📋 Sample Analysis Results")
+        st.markdown("**Example: 383 MAPLEHURST AVE (RL1-0 Zone)**")
+        
+        sample_col1, sample_col2, sample_col3 = st.columns(3)
+        with sample_col1:
+            st.metric("Zone Designation", "RL1-0")
+            st.caption("Low density with infill permissions")
+        with sample_col2:
+            st.metric("Max Coverage", "25%")
+            st.caption("Enhanced from standard 20%")
+        with sample_col3:
+            st.metric("Front Setback", "Existing -1m")
+            st.caption("Reduced for infill development")
+        
+        st.info("💡 **Ready to analyze your property?** Enter an address in the sidebar to get started!")
+        
+    elif 'lookup_triggered' in st.session_state and st.session_state['lookup_triggered']:
         # Determine input method based on what data is available in session state
         if 'address' in st.session_state:
             input_method = "address"
@@ -2121,10 +2833,18 @@ def main():
             display_zone = full_zone_code or zone_code or "Unknown"
             st.metric("🏘️ Zone Code", display_zone)
         with col2:
-            st.metric("📊 Data Source", data_source)
+            # Display coordinates instead of data source
+            if lat and lon:
+                st.metric("📍 Coordinates", f"{lat:.6f}, {lon:.6f}")
+                st.caption(f"Lat: {lat:.6f}° | Lon: {lon:.6f}°")
+            else:
+                st.metric("📍 Coordinates", "Not available")
         with col3:
             if parcel.get("roll_number"):
                 st.metric("📋 Roll Number", parcel["roll_number"])
+            else:
+                # Show zone classification as additional info instead of data source
+                st.metric("🏘️ Zone Type", "Residential" if zone_code and zone_code.startswith(('RL', 'RM', 'RH')) else "Unknown")
         
         # Get lot dimensions - use calculated if available, otherwise manual input
         st.header("📏 Lot Dimensions")
@@ -2146,9 +2866,11 @@ def main():
             st.info("📐 Please provide lot dimensions for zoning analysis (geometry not available for automatic calculation).")
             col1, col2 = st.columns(2)
             with col1:
-                frontage = st.number_input("Lot Frontage (m)", min_value=0.0, value=15.0, step=0.1, key="manual_frontage")
+                frontage = st.number_input("Lot Frontage (m)", min_value=0.0, value=0.0, step=0.1, key="manual_frontage")
+                st.caption("Enter 0 if unknown - will display as N/A")
             with col2:
-                depth = st.number_input("Lot Depth (m)", min_value=0.0, value=30.0, step=0.1, key="manual_depth")
+                depth = st.number_input("Lot Depth (m)", min_value=0.0, value=0.0, step=0.1, key="manual_depth")
+                st.caption("Enter 0 if unknown - will display as N/A")
         
         # Show available addresses for testing
         if st.checkbox("🔍 Show Sample Addresses from Database"):
@@ -2162,14 +2884,15 @@ def main():
                         st.session_state['address'] = addr
                         st.rerun()
         
-        if frontage > 0 and depth > 0 and zone_code:
+        if zone_code:
             # Zoning Analysis Tab
             tabs = st.tabs(["🗺️ Zoning Analysis", "💰 Property Valuation", "🏗️ Development Potential", "📊 Special Requirements", "📋 Zone Rules"])
             
             with tabs[0]:
                 st.header("🗺️ Zoning Analysis & Compliance")
                 
-                # Get comprehensive zoning analysis with corner lot detection
+                # Get comprehensive zoning analysis (corner lot detection can be added later if needed)
+                corner_lot = False  # Default value since we removed property features from sidebar
                 development_potential = calculate_development_potential(zone_code, lot_area_m2, frontage, depth, corner_lot)
                 
                 if "error" in development_potential:
@@ -2221,7 +2944,7 @@ def main():
                             dimensions_data.append(["**Lot Area**", "N/A", "m²"])
                             dimensions_data.append(["", "N/A", "ft²"])
                         
-                        if frontage:
+                        if frontage and frontage > 0:
                             frontage_ft = frontage * 3.28084
                             dimensions_data.append(["**Lot Frontage**", f"{frontage:.2f}", "m"])
                             dimensions_data.append(["", f"{frontage_ft:.2f}", "ft"])
@@ -2229,7 +2952,7 @@ def main():
                             dimensions_data.append(["**Lot Frontage**", "N/A", "m"])
                             dimensions_data.append(["", "N/A", "ft"])
                             
-                        if depth:
+                        if depth and depth > 0:
                             depth_ft = depth * 3.28084
                             dimensions_data.append(["**Lot Depth**", f"{depth:.2f}", "m"])
                             dimensions_data.append(["", f"{depth_ft:.2f}", "ft"])
@@ -2318,9 +3041,53 @@ def main():
                         conservation_status = detect_conservation_requirements(parcel, zoning_info)
                         arborist_status = detect_arborist_requirements(parcel, lot_area_m2, development_potential)
                         
+                        # Check heritage status if coordinates are available
+                        heritage_status = "Unknown"
+                        development_status = "Unknown"
+                        conservation_authority_status = "Unknown"
+                        
+                        if lat and lon:
+                            try:
+                                heritage_check = check_heritage_property_status(lat, lon)
+                                if heritage_check.get('is_heritage'):
+                                    heritage_status = "Yes - Designated"
+                                elif heritage_check.get('designation_type') == 'Nearby':
+                                    heritage_status = "Nearby Heritage Area"
+                                else:
+                                    heritage_status = "No"
+                                    
+                                # Check development applications
+                                dev_check = check_development_applications(lat, lon)
+                                if dev_check.get('has_applications'):
+                                    development_status = f"Yes ({dev_check['total_count']} applications)"
+                                else:
+                                    development_status = "No"
+                                    
+                                # Check conservation authority
+                                ca_check = check_conservation_authority(lat, lon)
+                                ca_name = ca_check.get('conservation_authority', 'Unknown')
+                                if 'Halton' in ca_name:
+                                    permits_req = ca_check.get('permits_required', 'Unknown')
+                                    if permits_req == 'Likely Required':
+                                        conservation_authority_status = "Halton CA - Permits Required"
+                                    elif permits_req == 'Possibly Required':
+                                        conservation_authority_status = "Halton CA - Contact Required"
+                                    else:
+                                        conservation_authority_status = "Halton Conservation Authority"
+                                else:
+                                    conservation_authority_status = ca_name
+                                    
+                            except:
+                                heritage_status = "Unable to check"
+                                development_status = "Unable to check"
+                                conservation_authority_status = "Unable to check"
+                        
                         info_data = []
                         info_data.append(["**Conservation**", conservation_status])
                         info_data.append(["**Arborist**", arborist_status])
+                        info_data.append(["**Heritage**", heritage_status])
+                        info_data.append(["**Development Apps**", development_status])
+                        info_data.append(["**Conservation Authority**", conservation_authority_status])
                         
                         for label, value in info_data:
                             cols = st.columns([2, 1])
@@ -2457,13 +3224,79 @@ def main():
                     st.markdown("---")
                     st.caption("*This information was collected by scaling online city mapping, this information should be confirmed with accurate survey.*")
                     
+                    # Final Buildable Area Analysis
+                    st.subheader("🏗️ Final Buildable Floor Area Analysis")
+                    final_analysis = development_potential.get('final_buildable_analysis', {})
+                    
+                    if final_analysis.get('final_buildable_sqft'):
+                        # Create analysis summary box
+                        st.success(f"""
+                        ### ✅ Final Analysis Result
+                        
+                        Based on our understanding and interpretation of the by-law, we are confident that you can build a house of approximately **{final_analysis['final_buildable_sqft']:,.0f} sq. ft.** ({final_analysis['final_buildable_sqm']:,.0f} sq. m.)
+                        
+                        **Confidence Level:** {final_analysis.get('confidence_level', 'Moderate')}
+                        """)
+                        
+                        # Show calculation breakdown
+                        with st.expander("📊 Detailed Calculation Breakdown"):
+                            st.markdown("#### Calculation Method: " + final_analysis.get('calculation_method', 'Standard'))
+                            
+                            calc_cols = st.columns(2)
+                            
+                            with calc_cols[0]:
+                                st.markdown("**Step 1: Lot Coverage**")
+                                if final_analysis.get('lot_coverage_sqft'):
+                                    coverage_pct = development_potential.get('max_coverage_percent', 30)
+                                    st.write(f"• {coverage_pct:.0f}% × {lot_area_m2:,.2f} m²")
+                                    st.write(f"• = {final_analysis['lot_coverage_sqm']:,.2f} m²")
+                                    st.write(f"• = {final_analysis['lot_coverage_sqft']:,.2f} sq. ft.")
+                                
+                                st.markdown("**Step 2: Gross Floor Area**")
+                                if final_analysis.get('gross_floor_area_sqft'):
+                                    st.write(f"• Coverage: {final_analysis.get('lot_coverage_sqft', 0):,.2f} sq. ft.")
+                                    st.write(f"• × {final_analysis.get('max_floors', 2)} floors")
+                                    st.write(f"• = {final_analysis['gross_floor_area_sqft']:,.2f} sq. ft.")
+                            
+                            with calc_cols[1]:
+                                st.markdown("**Step 3: Setback Deductions**")
+                                st.write(f"• Gross: {final_analysis.get('gross_floor_area_sqft', 0):,.2f} sq. ft.")
+                                st.write(f"• Minus: {final_analysis.get('setback_deduction_sqft', 750):,.0f} sq. ft. (setbacks)")
+                                st.write(f"• **Final: {final_analysis['final_buildable_sqft']:,.0f} sq. ft.**")
+                                
+                                st.markdown("**Important Factors:**")
+                                st.write("• Maximum Residential Floor Area Ratio")
+                                st.write("• Maximum Lot Coverage")
+                                st.write("• Dwelling Setbacks")
+                                if development_potential.get('suffix') == "-0":
+                                    st.write("• Front Yard: Existing -1m")
+                                st.write(f"• Rear Yard: {setbacks.get('rear_yard', 'N/A')} m")
+                            
+                            if final_analysis.get('analysis_note'):
+                                st.info(f"📝 {final_analysis['analysis_note']}")
+                    else:
+                        st.warning("⚠️ Unable to calculate final buildable area - insufficient data available")
+                        if final_analysis.get('analysis_note'):
+                            st.caption(final_analysis['analysis_note'])
+                        
+                        # Check if it's due to "-1" setback requirement
+                        buildable_info = development_potential.get('note')
+                        if buildable_info and 'survey data' in buildable_info:
+                            st.info("📋 **Survey Required**: Property has 'existing -1m' front yard setback requirement. A survey is needed to determine the exact existing building setback for accurate calculations.")
+                    
+                    st.markdown("---")
+                    
                     # Detailed setbacks section
                     st.subheader("📏 Precise Setback Requirements")
                     setbacks = development_potential.get('setbacks', {})
                     
                     setback_cols = st.columns(5)
                     with setback_cols[0]:
-                        st.metric("Front Yard", f"{setbacks.get('front_yard', 'N/A')} m")
+                        front_yard_val = setbacks.get('front_yard', 'N/A')
+                        if front_yard_val == "-1":
+                            st.metric("Front Yard", "Existing -1 m")
+                        else:
+                            st.metric("Front Yard", f"{front_yard_val} m")
                     with setback_cols[1]:
                         st.metric("Rear Yard", f"{setbacks.get('rear_yard', 'N/A')} m")
                     with setback_cols[2]:
@@ -2505,14 +3338,53 @@ def main():
                         st.subheader("⭐ Special Provisions")
                         st.warning(f"This property has special provision: {special_provision}")
                         st.info("Special provisions may modify standard zoning requirements. Consult planning services for specific details.")
+                    
+                    # PDF Download Section
+                    st.markdown("---")
+                    st.subheader("📄 Generate Property Report")
+                    
+                    if PDF_GENERATOR_AVAILABLE:
+                        if st.button("📄 Generate PDF Report", type="secondary", use_container_width=True):
+                            with st.spinner("Generating PDF report..."):
+                                # Prepare property data for PDF
+                                property_data = prepare_property_data_for_pdf(
+                                    parcel, zone_code, full_zone_code, development_potential,
+                                    setbacks, lot_area_m2, frontage, depth
+                                )
+                                
+                                # Generate PDF
+                                pdf_generator = PropertyReportGenerator()
+                                pdf_buffer = io.BytesIO()
+                                pdf_generator.generate_property_report(property_data, pdf_buffer)
+                                pdf_buffer.seek(0)
+                                
+                                # Offer download
+                                property_address = parcel.get("address", "Property").replace(" ", "_").replace(",", "")
+                                filename = f"{property_address}_Property_Report_{datetime.now().strftime('%Y%m%d')}.pdf"
+                                
+                                st.download_button(
+                                    label="📥 Download Property Report PDF",
+                                    data=pdf_buffer.getvalue(),
+                                    file_name=filename,
+                                    mime="application/pdf",
+                                    type="primary",
+                                    use_container_width=True
+                                )
+                                
+                                st.success("✅ PDF report generated successfully!")
+                    else:
+                        st.warning("PDF generation not available. Please ensure all required dependencies are installed.")
             
             with tabs[1]:
                 st.header("💰 Property Valuation & Market Analysis")
                 
                 # Calculate property valuation
+                # Use default values for property features since they're no longer in sidebar
                 valuation = estimate_property_value(
                     zone_code, lot_area_m2, building_area, "detached_dwelling",
-                    bedrooms, bathrooms, age, nearby_parks, waterfront, heritage, corner_lot, special_provision
+                    bedrooms, bathrooms, age, 
+                    nearby_parks=1, waterfront=False, heritage_designated=False, 
+                    is_corner=False, special_provision=special_provision
                 )
                 
                 # Main valuation metrics
@@ -2651,6 +3523,113 @@ def main():
                         "estimated_tree_survey_cost": 0,
                         "arborist_triggers": []
                     }
+                
+                # === REAL-TIME API CHECKS ===
+                st.subheader("🔍 Live API Checks")
+                
+                # Heritage Properties Check
+                heritage_check = check_heritage_property_status(lat, lon)
+                dev_check = check_development_applications(lat, lon)
+                conservation_check = check_conservation_authority(lat, lon)
+                
+                api_cols = st.columns(3)
+                
+                with api_cols[0]:
+                    st.markdown("**Heritage Property Status**")
+                    if heritage_check.get('is_heritage'):
+                        st.success("🏛️ **HERITAGE PROPERTY FOUND**")
+                        for prop in heritage_check.get('properties', []):
+                            with st.expander(f"Heritage Property: {prop.get('address', 'Unknown')}"):
+                                st.write(f"**Heritage ID:** {prop.get('heritage_id', 'N/A')}")
+                                st.write(f"**By-law:** {prop.get('bylaw', 'N/A')}")
+                                st.write(f"**Designation Year:** {prop.get('year', 'N/A')}")
+                                st.write(f"**Status:** {prop.get('status', 'N/A')}")
+                                if prop.get('description'):
+                                    st.write(f"**Description:** {prop['description']}")
+                    elif heritage_check.get('designation_type') == 'Nearby':
+                        st.warning(f"🏘️ **{heritage_check['nearby_heritage_count']} heritage properties nearby**")
+                        st.caption("Property may be subject to heritage area guidelines")
+                    else:
+                        st.info("✅ No heritage designation found")
+                
+                with api_cols[1]:
+                    st.markdown("**Development Applications**")
+                    if dev_check.get('has_applications'):
+                        st.warning(f"📋 **{dev_check['total_count']} applications found in area**")
+                        for idx, app in enumerate(dev_check.get('applications', [])[:3]):
+                            app_title = app.get('application_number', 'Unknown Application')
+                            app_type = app.get('type', 'Unknown')
+                            with st.expander(f"Development App: {app_title} ({app_type})"):
+                                
+                                # Show available information
+                                status = app.get('status', 'N/A')
+                                if status and status != 'Status not available':
+                                    st.write(f"**Status:** {status}")
+                                else:
+                                    st.write(f"**Status:** Not specified")
+                                
+                                st.write(f"**Application Type:** {app.get('type', 'Unknown')}")
+                                
+                                if app.get('date_received'):
+                                    st.write(f"**Date Created:** {app['date_received']}")
+                                
+                                # Additional technical information
+                                if app.get('folder_rsn'):
+                                    st.write(f"**Folder Reference:** {app['folder_rsn']}")
+                                
+                                north_oak = app.get('north_oak', 'Unknown')
+                                if north_oak and north_oak != 'Unknown':
+                                    st.write(f"**North Oakville:** {north_oak}")
+                                
+                                # Note about limited API data
+                                st.caption("ℹ️ Limited details available from municipal API. Contact planning department for full application details.")
+                                
+                                # Debug information - show available fields (only in debug mode)
+                                if st.checkbox("🔍 Show API Debug Info", key=f"debug_dev_app_{idx}"):
+                                    available_fields = app.get('available_fields', [])
+                                    if available_fields:
+                                        st.write("**Available API Fields:**")
+                                        for field in available_fields:
+                                            st.write(f"• {field}")
+                                    else:
+                                        st.write("No fields available in API response")
+                    else:
+                        st.info("✅ No development applications in area")
+                
+                with api_cols[2]:
+                    st.markdown("**Conservation Authority**")
+                    ca_name = conservation_check.get('conservation_authority', 'Unknown')
+                    permits_req = conservation_check.get('permits_required', 'Unknown')
+                    
+                    if 'Halton' in ca_name:
+                        st.success(f"🌊 **{ca_name}**")
+                        
+                        if permits_req == 'Likely Required':
+                            st.warning("⚠️ **Permits Likely Required**")
+                        elif permits_req == 'Possibly Required':
+                            st.info("ℹ️ **Permits Possibly Required**")
+                        else:
+                            st.info(f"**Status:** {permits_req}")
+                            
+                        contact_info = conservation_check.get('contact_info', {})
+                        if contact_info:
+                            with st.expander("📞 Contact Information"):
+                                st.write(f"**Phone:** {contact_info.get('phone', 'N/A')}")
+                                st.write(f"**Email:** {contact_info.get('email', 'N/A')}")
+                                if contact_info.get('website'):
+                                    st.write(f"**Website:** [Visit]({contact_info['website']})")
+                                    
+                        regulated_features = conservation_check.get('regulated_features', [])
+                        if regulated_features:
+                            with st.expander("🚫 Regulated Features"):
+                                for feature in regulated_features:
+                                    st.write(f"• {feature}")
+                    else:
+                        st.info(f"ℹ️ **{ca_name}**")
+                        if conservation_check.get('error'):
+                            st.caption("Unable to verify - contact required")
+                
+                st.markdown("---")
                 
                 # === HERITAGE CONSERVATION ASSESSMENT ===
                 st.subheader("🏛️ Heritage Conservation Assessment")
@@ -2816,8 +3795,17 @@ def main():
                         ]
                     })
                 
-                # Heritage requirements (enhanced)
-                if heritage:
+                # Heritage requirements (enhanced) - use actual heritage status
+                # Check if property has heritage designation
+                heritage_designated = False
+                if lat and lon:
+                    try:
+                        heritage_check = check_heritage_property_status(lat, lon)
+                        heritage_designated = heritage_check.get('is_heritage', False)
+                    except:
+                        heritage_designated = False
+                
+                if heritage_designated:
                     requirements.append({
                         "category": "Heritage Property Requirements",
                         "items": [
