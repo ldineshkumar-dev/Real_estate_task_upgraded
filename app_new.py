@@ -29,6 +29,18 @@ except ImportError:
     PDF_GENERATOR_AVAILABLE = False
     st.warning("⚠️ PDF Generator not available. PDF download feature will be limited.")
 
+try:
+    from dwelling_type_validator import (
+        validate_dwelling_type_for_zone,
+        get_permitted_dwelling_types,
+        validate_development_proposal,
+        generate_compliance_report
+    )
+    DWELLING_VALIDATOR_AVAILABLE = True
+except ImportError:
+    DWELLING_VALIDATOR_AVAILABLE = False
+    st.warning("⚠️ Dwelling Type Validator not available. Zone compliance checking will be limited.")
+
 # ------------------------
 # CONFIG & CONSTANTS
 # ------------------------
@@ -351,7 +363,8 @@ def detect_conservation_requirements(parcel, zoning_info):
         
         # If API is not available, fall back to legacy method
         else:
-            st.warning("Heritage API unavailable - using fallback detection")
+            # API not available - use fallback silently (no need to warn user)
+            pass
     
     except Exception as e:
         # Fallback gracefully if heritage API fails
@@ -1460,6 +1473,16 @@ def calculate_development_potential(zone_code, lot_area, lot_frontage, lot_depth
     # Use restrictions
     results["use_restrictions"] = rules.get('use_restrictions', {})
     
+    # Dwelling type validation (NEW: Critical compliance checking)
+    if DWELLING_VALIDATOR_AVAILABLE:
+        permitted_dwelling_types = get_permitted_dwelling_types(zone_code)
+        results["permitted_dwelling_types"] = permitted_dwelling_types
+        results["dwelling_type_restrictions"] = {
+            "summary": f"Only {len(permitted_dwelling_types)} dwelling type(s) permitted in {base_zone}",
+            "permitted_types": permitted_dwelling_types,
+            "compliance_note": "All development proposals must comply with Table 6.2.1 and 6.2.2 of Oakville Zoning By-law 2014-014"
+        }
+    
     # Plan subdivision adjustments
     if rules.get('plan_subdivision_adjustments'):
         results["plan_subdivision_adjustments"] = rules['plan_subdivision_adjustments']
@@ -1722,11 +1745,12 @@ def display_zone_rules_tab(zone_code: str):
             front_suffix = setbacks.get('front_yard_suffix_0')
             if front_val:
                 st.metric("🔸 Front Yard", f"{front_val} m")
+                st.caption(f"({float(front_val) * 3.28084:.1f} ft)")
                 if parsed_info['has_suffix_zero'] and front_suffix:
                     if isinstance(front_suffix, str):
                         st.caption(f"**-0:** {front_suffix}")
                     else:
-                        st.caption(f"**-0:** {front_suffix} m")
+                        st.caption(f"**-0:** {front_suffix} m ({float(front_suffix) * 3.28084:.1f} ft)")
             else:
                 st.metric("🔸 Front Yard", "N/A")
         
@@ -1736,11 +1760,12 @@ def display_zone_rules_tab(zone_code: str):
             rear_suffix = setbacks.get('rear_yard_suffix_0')
             if rear_val:
                 st.metric("🔸 Rear Yard", f"{rear_val} m")
+                st.caption(f"({float(rear_val) * 3.28084:.1f} ft)")
                 if parsed_info['has_suffix_zero'] and rear_suffix:
                     if isinstance(rear_suffix, str):
                         st.caption(f"**-0:** {rear_suffix}")
                     else:
-                        st.caption(f"**-0:** {rear_suffix} m")
+                        st.caption(f"**-0:** {rear_suffix} m ({float(rear_suffix) * 3.28084:.1f} ft)")
             else:
                 st.metric("🔸 Rear Yard", "N/A")
         
@@ -1752,10 +1777,12 @@ def display_zone_rules_tab(zone_code: str):
             
             if interior_val:
                 st.metric("🔸 Interior Side", f"{interior_val} m")
+                st.caption(f"({float(interior_val) * 3.28084:.1f} ft)")
             elif interior_min:
                 st.metric("🔸 Interior Side", f"{interior_min} m min")
+                st.caption(f"({float(interior_min) * 3.28084:.1f} ft min)")
                 if interior_max:
-                    st.caption(f"Max: {interior_max} m")
+                    st.caption(f"Max: {interior_max} m ({float(interior_max) * 3.28084:.1f} ft)")
             else:
                 st.metric("🔸 Interior Side", "N/A")
         
@@ -1764,6 +1791,7 @@ def display_zone_rules_tab(zone_code: str):
             flankage_val = setbacks.get('flankage_yard')
             if flankage_val:
                 st.metric("🔸 Flankage Yard", f"{flankage_val} m")
+                st.caption(f"({float(flankage_val) * 3.28084:.1f} ft)")
                 st.caption("Corner lots only")
             else:
                 st.metric("🔸 Flankage Yard", "N/A")
@@ -1909,6 +1937,42 @@ def display_zone_rules_tab(zone_code: str):
     else:
         st.info("ℹ️ No specific permitted uses listed")
     
+    # Dwelling Type Restrictions - Critical compliance information
+    st.markdown("---")
+    st.subheader("🏠 Permitted Dwelling Types (Critical Compliance)")
+    
+    if DWELLING_VALIDATOR_AVAILABLE:
+        permitted_dwelling_types = get_permitted_dwelling_types(zone_code)
+        
+        if permitted_dwelling_types:
+            st.info("**📋 Only the following dwelling types are permitted in this zone according to Tables 6.2.1 and 6.2.2:**")
+            
+            # Display in columns for better layout
+            dwelling_cols = st.columns(min(len(permitted_dwelling_types), 3))
+            for idx, dwelling_type in enumerate(permitted_dwelling_types):
+                with dwelling_cols[idx % 3]:
+                    clean_dwelling = dwelling_type.replace('_', ' ').title()
+                    st.success(f"🏠 {clean_dwelling}")
+            
+            # Add critical compliance note
+            st.error("⚠️ **CRITICAL:** Any development proposal with dwelling types NOT listed above will be non-compliant with Oakville Zoning By-law 2014-014")
+            
+            # Show specific zone restrictions for common dwelling types
+            base_zone = zone_code.split('-')[0].split(' ')[0]
+            
+            if 'duplex_dwelling' not in permitted_dwelling_types and base_zone != 'RL10':
+                st.warning("🚫 **Duplex dwellings** are ONLY permitted in RL10 zones")
+            
+            if 'linked_dwelling' not in permitted_dwelling_types and base_zone != 'RL11':
+                st.warning("🚫 **Linked dwellings** are ONLY permitted in RL11 zones")
+                
+            if 'townhouse_dwelling' not in permitted_dwelling_types and base_zone not in ['RUC', 'RM1']:
+                st.warning("🚫 **Townhouse dwellings** are ONLY permitted in RUC and RM1 zones")
+        else:
+            st.error("❌ No dwelling type information available for this zone")
+    else:
+        st.warning("⚠️ Dwelling type validation not available - please ensure compliance with official zoning by-law")
+    
     # Use Restrictions - Clear formatting
     if 'use_restrictions' in zone_rules:
         st.markdown("---")
@@ -1998,7 +2062,7 @@ def assess_heritage_conservation_requirements(zone_code: str, address: str, lat:
     
     # === CONSERVATION REQUIREMENTS ===
     # Conservation use is permitted in all residential zones per Oakville by-law
-    conservation_permitted = zone_code.startswith(('RL', 'RM', 'RH')) or zone_code == 'RUC'
+    conservation_permitted = zone_code.startswith(('RL', 'RM', 'RH', 'RUC'))
     
     results["conservation_requirements"] = {
         "conservation_use_permitted": conservation_permitted,
@@ -2815,16 +2879,14 @@ def main():
             if frontage:
                 st.metric("📏 Frontage", f"{frontage:.1f} ft")
                 st.caption(f"({parcel.get('frontage_meters', 0):.1f} m)")
-            else:
-                st.metric("📏 Frontage", "Not calculated")
+            # Removed "Not calculated" - only show when available
         
         with col4:
             depth = parcel.get("depth")
             if depth:
                 st.metric("📐 Depth", f"{depth:.1f} ft")
                 st.caption(f"({parcel.get('depth_meters', 0):.1f} m)")
-            else:
-                st.metric("📐 Depth", "Not calculated")
+            # Removed "Not calculated" - only show when available
         
         # Additional info row
         col1, col2, col3 = st.columns(3)
@@ -2844,7 +2906,7 @@ def main():
                 st.metric("📋 Roll Number", parcel["roll_number"])
             else:
                 # Show zone classification as additional info instead of data source
-                st.metric("🏘️ Zone Type", "Residential" if zone_code and zone_code.startswith(('RL', 'RM', 'RH')) else "Unknown")
+                st.metric("🏘️ Zone Type", "Residential" if zone_code and zone_code.startswith(('RL', 'RM', 'RH', 'RUC')) else "Unknown")
         
         # Get lot dimensions - use calculated if available, otherwise manual input
         st.header("📏 Lot Dimensions")
@@ -3295,24 +3357,46 @@ def main():
                         front_yard_val = setbacks.get('front_yard', 'N/A')
                         if front_yard_val == "-1":
                             st.metric("Front Yard", "Existing -1 m")
-                        else:
+                            st.caption("(-3.3 ft)")
+                        elif front_yard_val != 'N/A':
                             st.metric("Front Yard", f"{front_yard_val} m")
+                            st.caption(f"({float(front_yard_val) * 3.28084:.1f} ft)")
+                        else:
+                            st.metric("Front Yard", "N/A")
                     with setback_cols[1]:
-                        st.metric("Rear Yard", f"{setbacks.get('rear_yard', 'N/A')} m")
+                        rear_yard_val = setbacks.get('rear_yard', 'N/A')
+                        if rear_yard_val != 'N/A':
+                            st.metric("Rear Yard", f"{rear_yard_val} m")
+                            st.caption(f"({float(rear_yard_val) * 3.28084:.1f} ft)")
+                        else:
+                            st.metric("Rear Yard", "N/A")
                     with setback_cols[2]:
                         if 'interior_side_min' in setbacks:
-                            st.metric("Side Yard Min", f"{setbacks['interior_side_min']} m")
-                            st.metric("Side Yard Max", f"{setbacks['interior_side_max']} m")
+                            side_min = setbacks['interior_side_min']
+                            side_max = setbacks['interior_side_max']
+                            st.metric("Side Yard Min", f"{side_min} m")
+                            st.caption(f"({float(side_min) * 3.28084:.1f} ft)")
+                            st.metric("Side Yard Max", f"{side_max} m")
+                            st.caption(f"({float(side_max) * 3.28084:.1f} ft)")
                         else:
-                            st.metric("Interior Side", f"{setbacks.get('interior_side', 'N/A')} m")
+                            interior_side = setbacks.get('interior_side', 'N/A')
+                            if interior_side != 'N/A':
+                                st.metric("Interior Side", f"{interior_side} m")
+                                st.caption(f"({float(interior_side) * 3.28084:.1f} ft)")
+                            else:
+                                st.metric("Interior Side", "N/A")
                     with setback_cols[3]:
                         if setbacks.get('flankage_yard'):
-                            st.metric("Flankage Yard", f"{setbacks['flankage_yard']} m")
+                            flankage_val = setbacks['flankage_yard']
+                            st.metric("Flankage Yard", f"{flankage_val} m")
+                            st.caption(f"({float(flankage_val) * 3.28084:.1f} ft)")
                         else:
                             st.write("N/A - Not Corner")
                     with setback_cols[4]:
                         if setbacks.get('garage_interior_side'):
-                            st.metric("Garage Side", f"{setbacks['garage_interior_side']} m")
+                            garage_side = setbacks['garage_interior_side']
+                            st.metric("Garage Side", f"{garage_side} m")
+                            st.caption(f"({float(garage_side) * 3.28084:.1f} ft)")
                             st.caption(f"Applies to: {setbacks.get('garage_applies_to', 'N/A')}")
                     
                     # Special provisions display
@@ -3481,6 +3565,109 @@ def main():
             
             with tabs[3]:
                 st.header("📋 Special Requirements Assessment")
+                
+                # DWELLING TYPE COMPLIANCE - CRITICAL ASSESSMENT
+                st.subheader("🏠 Dwelling Type Compliance (MANDATORY)")
+                st.error("**⚠️ CRITICAL:** All development proposals must comply with zone-specific dwelling type restrictions per Tables 6.2.1 and 6.2.2 of Oakville Zoning By-law 2014-014")
+                
+                if DWELLING_VALIDATOR_AVAILABLE:
+                    permitted_dwelling_types = get_permitted_dwelling_types(zone_code)
+                    base_zone = zone_code.split('-')[0].split(' ')[0]
+                    
+                    # Create compliance assessment box
+                    st.info(f"""
+                    ### 📋 Zone {base_zone} Dwelling Type Restrictions
+                    
+                    **Only the following dwelling types are legally permitted in this zone:**
+                    """)
+                    
+                    # Display permitted types in an organized way
+                    if permitted_dwelling_types:
+                        dwelling_cols = st.columns(min(len(permitted_dwelling_types), 2))
+                        for idx, dwelling_type in enumerate(permitted_dwelling_types):
+                            with dwelling_cols[idx % 2]:
+                                clean_dwelling = dwelling_type.replace('_', ' ').title()
+                                st.success(f"✅ {clean_dwelling}")
+                    
+                    # Show zone-specific warnings
+                    compliance_warnings = []
+                    
+                    if base_zone != 'RL10' and 'duplex_dwelling' not in permitted_dwelling_types:
+                        compliance_warnings.append("🚫 **Duplex dwellings** are ONLY permitted in RL10 zones")
+                    
+                    if base_zone != 'RL11' and 'linked_dwelling' not in permitted_dwelling_types:
+                        compliance_warnings.append("🚫 **Linked dwellings** are ONLY permitted in RL11 zones")
+                    
+                    if base_zone not in ['RUC', 'RM1'] and 'townhouse_dwelling' not in permitted_dwelling_types:
+                        compliance_warnings.append("🚫 **Townhouse dwellings** are ONLY permitted in RUC and RM1 zones")
+                    
+                    if base_zone not in ['RL7', 'RL8', 'RL9', 'RUC'] and 'semi_detached_dwelling' not in permitted_dwelling_types:
+                        compliance_warnings.append("🚫 **Semi-detached dwellings** are ONLY permitted in RL7, RL8, RL9, and RUC zones")
+                    
+                    if compliance_warnings:
+                        st.warning("### ⚠️ Important Dwelling Type Restrictions")
+                        for warning in compliance_warnings:
+                            st.warning(warning)
+                    
+                    # Development proposal validator
+                    st.markdown("---")
+                    st.subheader("🔍 Development Proposal Validator")
+                    
+                    with st.form("dwelling_compliance_check"):
+                        st.write("**Check if your proposed dwelling types are compliant:**")
+                        
+                        # Create checkboxes for common dwelling types
+                        proposed_dwellings = []
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if st.checkbox("Detached Dwelling"):
+                                proposed_dwellings.append("detached_dwelling")
+                            if st.checkbox("Semi-Detached Dwelling"):
+                                proposed_dwellings.append("semi_detached_dwelling")
+                            if st.checkbox("Duplex Dwelling"):
+                                proposed_dwellings.append("duplex_dwelling")
+                        
+                        with col2:
+                            if st.checkbox("Townhouse Dwelling"):
+                                proposed_dwellings.append("townhouse_dwelling")
+                            if st.checkbox("Linked Dwelling"):
+                                proposed_dwellings.append("linked_dwelling")
+                            if st.checkbox("Apartment Dwelling"):
+                                proposed_dwellings.append("apartment_dwelling")
+                        
+                        submitted = st.form_submit_button("✅ Check Compliance")
+                        
+                        if submitted and proposed_dwellings:
+                            validation_result = validate_development_proposal(zone_code, proposed_dwellings)
+                            
+                            if validation_result['is_compliant']:
+                                st.success("✅ **COMPLIANT:** All proposed dwelling types are permitted in this zone!")
+                                st.write("**Compliant dwelling types:**")
+                                for dwelling in validation_result['compliant_dwellings']:
+                                    st.success(f"✅ {dwelling.replace('_', ' ').title()}")
+                            else:
+                                st.error("❌ **NON-COMPLIANT:** Some proposed dwelling types are NOT permitted in this zone!")
+                                
+                                if validation_result['compliant_dwellings']:
+                                    st.write("**✅ Compliant dwelling types:**")
+                                    for dwelling in validation_result['compliant_dwellings']:
+                                        st.success(f"✅ {dwelling.replace('_', ' ').title()}")
+                                
+                                if validation_result['non_compliant_dwellings']:
+                                    st.write("**❌ Non-compliant dwelling types:**")
+                                    for dwelling in validation_result['non_compliant_dwellings']:
+                                        st.error(f"❌ {dwelling.replace('_', ' ').title()}")
+                                
+                                st.error("**Next Steps:** You must either change your dwelling types or apply for a zoning variance.")
+                        
+                        elif submitted and not proposed_dwellings:
+                            st.warning("Please select at least one dwelling type to check compliance.")
+                
+                else:
+                    st.error("❌ Dwelling type validation system not available. Please manually verify compliance with Oakville Zoning By-law 2014-014 Tables 6.2.1 and 6.2.2")
+                
+                st.markdown("---")
                 
                 # Get comprehensive conservation, heritage, and arborist assessments
                 display_address = parcel.get("address", "Unknown")

@@ -195,8 +195,8 @@ class PropertyReportGenerator:
         rfa_header = [['Max RFA', '']]
         left_column.append(self._create_section_table(rfa_header, header=True))
         
-        max_floor_area = data.get('max_floor_area', 'N/A')
-        if max_floor_area != 'N/A':
+        max_floor_area = data.get('max_floor_area')
+        if max_floor_area is not None and max_floor_area != 'N/A':
             rfa_data = [
                 ['Maximum Area', f"{max_floor_area:.2f} m²"],
                 ['Maximum Area', f"{max_floor_area * 10.764:.2f} ft²"],
@@ -238,8 +238,8 @@ class PropertyReportGenerator:
         coverage_header = [['Max Coverage', '']]
         right_column.append(self._create_section_table(coverage_header, header=True))
         
-        coverage_area = data.get('max_coverage_area', 'N/A')
-        if coverage_area != 'N/A':
+        coverage_area = data.get('max_coverage_area')
+        if coverage_area is not None and coverage_area != 'N/A':
             coverage_data = [
                 ['Maximum Area', f"{coverage_area:.2f} m²"],
                 ['Maximum Area', f"{coverage_area * 10.764:.2f} ft²"],
